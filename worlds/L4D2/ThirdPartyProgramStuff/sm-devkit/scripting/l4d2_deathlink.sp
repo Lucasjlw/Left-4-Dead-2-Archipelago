@@ -143,26 +143,36 @@ public Action Timer_PollIncoming(Handle timer)
 
 void ApplyIncomingDeathLink()
 {
-	// Set the guard before killing anyone - the human survivor's own death
-	// hook must not echo this incoming DeathLink back out as an outgoing one.
+	// Set the guard before killing anyone - if the victim we pick is a human,
+	// their own death hook must not echo this incoming DeathLink back out.
 	g_bSuppressOutgoing = true;
 
-	bool killedAny = false;
+	// Collect every survivor still alive (bots included - "bot or not").
+	int candidates[MAXPLAYERS + 1];
+	int count = 0;
 
 	for (int i = 1; i <= MaxClients; i++)
 	{
 		if (IsClientInGame(i) && GetClientTeam(i) == TEAM_SURVIVOR && IsPlayerAlive(i))
 		{
-			killedAny = true;
-			ForcePlayerSuicide(i);
+			candidates[count++] = i;
 		}
 	}
 
-	if (!killedAny)
+	if (count == 0)
 	{
 		g_bSuppressOutgoing = false;
 		return;
 	}
+
+	// Pick a single random survivor to take the fall for the remote death.
+	int victim = candidates[GetRandomInt(0, count - 1)];
+
+	char victimName[MAX_NAME_LENGTH];
+	GetClientName(victim, victimName, sizeof(victimName));
+	LogMessage("l4d2_deathlink: incoming DeathLink - killing %s", victimName);
+
+	ForcePlayerSuicide(victim);
 
 	// Clear the guard on a short delay rather than immediately - the death
 	// hook may fire a frame later than this call returns.
