@@ -195,3 +195,7 @@ _speedups.html
 .LSOverride
 Thumbs.db
 [Dd]esktop.ini
+
+# Third-party SourceMod/L4DHooks includes copied in locally for compiling L4D2 plugins -
+# not authored by this project, copy your own from your SourceMod/L4DHooks install
+worlds/L4D2/ThirdPartyProgramStuff/sm-devkit/scripting/include/

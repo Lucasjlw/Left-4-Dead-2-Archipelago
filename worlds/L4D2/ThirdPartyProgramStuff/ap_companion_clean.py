@@ -10,7 +10,7 @@ import random
 import threading
 import winreg
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 
 DEBUG = False
 stop_event = threading.Event()
@@ -56,15 +56,24 @@ def find_all_l4d2_paths():
             found_paths.append(path)
     
     if not found_paths:
-        # Ask user if not found
+        # Ask user if not found - use a folder picker instead of input() since this
+        # is a windowed (console=False) build with no stdin to read from
         print("Could not auto-detect L4D2 installation.")
         while True:
-            user_path = input("Please enter your L4D2 installation path (e.g., C:\\Program Files (x86)\\Steam\\steamapps\\common\\Left 4 Dead 2): ")
+            root = tk.Tk()
+            root.withdraw()
+            user_path = filedialog.askdirectory(
+                title="Select your Left 4 Dead 2 installation folder"
+            )
+            root.destroy()
+            if not user_path:
+                # User cancelled the dialog - stop prompting rather than loop forever
+                break
             if os.path.exists(user_path):
                 found_paths.append(user_path)
                 break
-            print("Path not found. Please try again.")
-    
+            messagebox.showerror("Path not found", "That path does not exist. Please try again.")
+
     return found_paths
 
 # Auto-detect all L4D2 paths
@@ -368,6 +377,7 @@ unlocked_misc = []
 goal_campaigns = 1  # Will be set from slot_data
 goal_completed = False
 completed_campaigns = set()  # Track unique campaigns with a completed finale
+deathlink_enabled = False  # Set from slot_data's death_link option once Connected
 
 # Goal completion persistence (will be set per seed)
 GOAL_COMPLETED_FILE = None
@@ -600,6 +610,45 @@ def write_trap_command(trap_type):
             f.write(infected_name + '\n')
     except Exception as e:
         log(f"Failed to write trap file: {e}", "error")
+
+_last_deathlink_send = 0
+DEATHLINK_COOLDOWN = 3.0  # seconds, avoids duplicate Bounce sends from racing candidate paths
+
+async def send_deathlink_bounce(websocket, player_name, cause=""):
+    """Send a DeathLink Bounce packet to the Archipelago server"""
+    packet = [{
+        "cmd": "Bounce",
+        "tags": ["DeathLink"],
+        "data": {
+            "time": time.time(),
+            "source": player_name,
+            "cause": cause or f"{player_name} died in Left 4 Dead 2"
+        }
+    }]
+    await send_packet(websocket, packet)
+    log(f"DeathLink sent: {packet[0]['data']['cause']}", "info")
+
+def write_deathlink_trigger(source, cause):
+    """Write a DeathLink trigger file for the l4d2_deathlink SourceMod plugin to read"""
+    line = f"{int(time.time())}|{source}|{cause}\n"
+
+    for l4d2_path in L4D2_PATHS:
+        mod_data_path = os.path.join(l4d2_path, "left4dead2", "addons", "sourcemod", "data", "archipelago", "mod_data")
+        trigger_file = os.path.join(mod_data_path, "deathlink_incoming.txt")
+
+        try:
+            os.makedirs(mod_data_path, exist_ok=True)
+            with open(trigger_file, 'w') as f:
+                f.write(line)
+        except Exception as e:
+            log(f"Failed to write deathlink trigger: {e}", "error")
+
+    # Also try writing to the current working directory as a fallback
+    try:
+        with open("deathlink_incoming.txt", 'w') as f:
+            f.write(line)
+    except Exception as e:
+        log(f"Failed to write deathlink trigger fallback: {e}", "error")
 
 # Hardcoded location table for finale detection (avoids import issues)
 location_table = {
@@ -947,6 +996,16 @@ async def handle_server_message(message, player_name, websocket):
 
         # Get starting campaign from slot_data options
         options = slot_data.get("options", {})
+
+        # Respect the player's DeathLink YAML option - default the tag to on at Connect
+        # time (before slot_data is known), then drop it here if they opted out.
+        global deathlink_enabled
+        raw_deathlink = options.get("death_link")
+        if raw_deathlink is None:
+            raw_deathlink = options.get("L4D2DeathLink", False)
+        deathlink_enabled = bool(raw_deathlink)
+        log(f"DeathLink: {'enabled' if deathlink_enabled else 'disabled'}", "info")
+
         # Support both internal snake_case keys and class-name-style keys for resilience
         start_campaign_option = options.get("starting_campaign")
         if start_campaign_option is None:
@@ -1051,7 +1110,12 @@ async def handle_server_message(message, player_name, websocket):
             print(f"Failed to seed completed campaigns from checked_locations: {e}")
 
         # Request sync of existing items - use array format
-        return [{"cmd": "Sync"}]
+        response = [{"cmd": "Sync"}]
+        if not deathlink_enabled:
+            # Drop the DeathLink tag we optimistically sent at Connect time since
+            # the player's YAML has it turned off
+            response.append({"cmd": "ConnectUpdate", "items_handling": 0b111, "tags": ["AP"]})
+        return response
         
     elif cmd == "RoomInfo":
         log("Received room info", "info")
@@ -1092,7 +1156,19 @@ async def handle_server_message(message, player_name, websocket):
 
     elif cmd == "ConnectionRefused":
         log(f"Connection refused: {message.get('text', 'Unknown reason')}", "error")
-    
+
+    elif cmd == "Bounced":
+        tags = message.get("tags", [])
+        if deathlink_enabled and "DeathLink" in tags:
+            data = message.get("data", {})
+            source = data.get("source", "someone")
+            cause = data.get("cause", f"{source} died")
+            if source == player_name:
+                log("Ignoring own DeathLink echo", "info")
+            else:
+                log(f"DeathLink received: {cause}", "error")
+                write_deathlink_trigger(source, cause)
+
     elif cmd == "PrintJSON":
         # Suppress PrintJSON messages - actual item receives are logged via ReceivedItems
         pass
@@ -1187,6 +1263,27 @@ async def main_loop(websocket, player_name):
                 except Exception as e:
                     log(f"Debug location check error: {e}", "error")
 
+            # Check for outgoing DeathLink triggers from the l4d2_deathlink plugin
+            global _last_deathlink_send
+            for l4d2_path in (L4D2_PATHS if deathlink_enabled else []):
+                death_file = os.path.join(l4d2_path, "left4dead2", "addons", "sourcemod", "data", "archipelago", "mod_data", "deathlink_outgoing.txt")
+                if os.path.exists(death_file):
+                    try:
+                        with open(death_file, 'r') as f:
+                            content = f.read().strip()
+                        os.remove(death_file)
+
+                        now = time.time()
+                        if now - _last_deathlink_send >= DEATHLINK_COOLDOWN:
+                            _last_deathlink_send = now
+                            parts = content.split("|", 1)
+                            victim = parts[1] if len(parts) > 1 else player_name
+                            await send_deathlink_bounce(websocket, player_name, cause=f"{victim} died in Left 4 Dead 2")
+                        else:
+                            log("DeathLink send suppressed (cooldown)", "info")
+                    except Exception as e:
+                        log(f"DeathLink outgoing error: {e}", "error")
+
             await asyncio.sleep(0.1)
 
         except Exception as e:
@@ -1216,7 +1313,7 @@ async def connect_to_archipelago(server, slot_name, password=None):
                     "uuid": "",
                     "version": {"major": 0, "minor": 6, "build": 3, "class": "Version"},
                     "items_handling": 0b111,
-                    "tags": ["AP"]
+                    "tags": ["AP", "DeathLink"]
                 }
             ]
             
